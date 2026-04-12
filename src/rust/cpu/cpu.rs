@@ -4512,8 +4512,24 @@ pub unsafe fn reset_cpu() {
 
     set_tsc(0, 0);
 
-    *instruction_pointer = 0xFFFF0;
-    switch_cs_real_mode(0xF000);
+    // IBM-PC-standard reset state: linear EIP at 0xFFFFFFF0 with CS
+    // selector 0xF000 and a HIDDEN CS base of 0xFFFF0000.  This is the
+    // classic "cached shadow base that doesn't match the selector"
+    // trick — any CS reload via a far jump/call will recompute the
+    // base from the selector, but until then the first instruction is
+    // fetched from linear 0xFFFFFFF0.  Real firmware (SeaBIOS, OVMF,
+    // netboot BIOS) relies on this so the reset vector lands inside
+    // the firmware image mapped at the top of the 32-bit address space.
+    //
+    // This differs from what switch_cs_real_mode(0xF000) would set:
+    // switch_cs_real_mode derives segment_offsets from the selector
+    // shift (0xF000 << 4 = 0xF0000), which is correct *after* a CS
+    // reload but not for the reset-vector fetch.
+    *instruction_pointer = 0xFFFFFFF0u32 as i32;
+    *sreg.offset(CS as isize) = 0xF000;
+    *segment_is_null.offset(CS as isize) = false;
+    *segment_offsets.offset(CS as isize) = 0xFFFF0000u32 as i32;
+    update_cs_size(false);
 
     switch_seg(SS, 0x30);
     write_reg32(ESP, 0x100);
