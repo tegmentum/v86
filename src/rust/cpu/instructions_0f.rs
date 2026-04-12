@@ -3308,6 +3308,36 @@ pub unsafe fn instr_0FA2() {
             }
         },
 
+        0x0B => {
+            // Extended Topology Enumeration.  ECX selects the
+            // sub-leaf (level).  We report a single logical
+            // processor: one thread, one core, one package.
+            match read_reg32(ECX) {
+                0 => {
+                    // Level 0 = SMT (threads within a core).
+                    eax = 0;   // bits to shift APIC ID: 0 (no SMT)
+                    ebx = 1;   // number of logical processors at this level
+                    ecx = 0x0100; // level number 0, type 1 (SMT)
+                    edx = 0;   // x2APIC ID of current processor
+                },
+                1 => {
+                    // Level 1 = Core (cores within a package).
+                    eax = 0;   // bits to shift APIC ID: 0 (one core)
+                    ebx = 1;   // number of logical processors at this level
+                    ecx = 0x0201; // level number 1, type 2 (Core)
+                    edx = 0;   // x2APIC ID
+                },
+                _ => {
+                    // Higher levels: report invalid (type 0) to
+                    // terminate enumeration.
+                    eax = 0;
+                    ebx = 0;
+                    ecx = read_reg32(ECX) & 0xFF; // echo level number, type 0
+                    edx = 0;
+                },
+            }
+        },
+
         0x80000000 => {
             // maximum supported extended level
             eax = 5;
