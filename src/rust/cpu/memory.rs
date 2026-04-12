@@ -53,6 +53,7 @@ pub static mut mem8: *mut u8 = ptr::null_mut();
 pub struct FirmwareWindow {
     pub base: u32,
     pub data: Box<[u8]>,
+    pub writable: bool,
 }
 
 impl FirmwareWindow {
@@ -72,11 +73,12 @@ pub static mut firmware_window: Option<FirmwareWindow> = None;
 /// Call BEFORE starting the CPU — installing while the CPU is running
 /// is undefined because the MMIO dispatch chain reads `firmware_window`
 /// without synchronisation.
-pub fn install_firmware_window(base: u32, data: Vec<u8>) {
+pub fn install_firmware_window(base: u32, data: Vec<u8>, writable: bool) {
     unsafe {
         firmware_window = Some(FirmwareWindow {
             base,
             data: data.into_boxed_slice(),
+            writable,
         });
     }
 }
@@ -120,6 +122,38 @@ unsafe fn firmware_read32(addr: u32) -> i32 {
     let fw = firmware_window.as_ref().unwrap_unchecked();
     let off = (addr - fw.base) as usize;
     ptr::read_unaligned(fw.data.as_ptr().add(off) as *const i32)
+}
+
+#[inline]
+#[allow(static_mut_refs)]
+unsafe fn firmware_writable() -> bool {
+    firmware_window
+        .as_ref()
+        .map_or(false, |fw| fw.writable)
+}
+
+#[inline]
+#[allow(static_mut_refs)]
+unsafe fn firmware_write8(addr: u32, value: u8) {
+    let fw = firmware_window.as_mut().unwrap_unchecked();
+    let off = (addr - fw.base) as usize;
+    *fw.data.get_unchecked_mut(off) = value;
+}
+
+#[inline]
+#[allow(static_mut_refs)]
+unsafe fn firmware_write16(addr: u32, value: u16) {
+    let fw = firmware_window.as_mut().unwrap_unchecked();
+    let off = (addr - fw.base) as usize;
+    ptr::write_unaligned(fw.data.as_mut_ptr().add(off) as *mut u16, value);
+}
+
+#[inline]
+#[allow(static_mut_refs)]
+unsafe fn firmware_write32(addr: u32, value: i32) {
+    let fw = firmware_window.as_mut().unwrap_unchecked();
+    let off = (addr - fw.base) as usize;
+    ptr::write_unaligned(fw.data.as_mut_ptr().add(off) as *mut i32, value);
 }
 
 #[no_mangle]
@@ -372,7 +406,9 @@ pub unsafe fn mmap_write8(addr: u32, value: i32) {
         *vga_mem8.offset((addr - VGA_LFB_ADDRESS) as isize) = value as u8
     }
     else if in_firmware_window(addr) {
-        // ROM — writes silently drop.  NVRAM support is future work.
+        if firmware_writable() {
+            firmware_write8(addr, value as u8);
+        }
     }
     else {
         ext::mmap_write8(addr, value)
@@ -387,7 +423,9 @@ pub unsafe fn mmap_write16(addr: u32, value: i32) {
         )
     }
     else if in_firmware_window(addr) {
-        // ROM — writes silently drop.
+        if firmware_writable() {
+            firmware_write16(addr, value as u16);
+        }
     }
     else {
         ext::mmap_write16(addr, value)
@@ -410,7 +448,9 @@ pub unsafe fn mmap_write32(addr: u32, value: i32) {
         handle_irqs();
     }
     else if in_firmware_window(addr) {
-        // ROM — writes silently drop.
+        if firmware_writable() {
+            firmware_write32(addr, value);
+        }
     }
     else {
         ext::mmap_write32(addr, value)
