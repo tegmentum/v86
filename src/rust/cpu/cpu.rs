@@ -2361,8 +2361,20 @@ pub unsafe fn read_imm8() -> OrPageFault<i32> {
         *eip_phys = (translate_address_read(eip)? ^ eip as u32) as i32;
         *last_virt_eip = eip & !0xFFF
     }
-    dbg_assert!(!memory::in_mapped_range((*eip_phys ^ eip) as u32));
-    let data8 = *memory::mem8.offset((*eip_phys ^ eip) as isize) as i32;
+    let phys = (*eip_phys ^ eip) as u32;
+    // Fast path: RAM.  The RAM-only case is the vast majority of fetches,
+    // stays fully inlined, and the extra `phys < memory_size` compare is a
+    // predictable branch for pure-RAM workloads (linux/seabios/test/pcitest).
+    let data8 = if phys < *memory_size {
+        *memory::mem8.offset(phys as isize) as i32
+    }
+    else {
+        // Above memory_size — either a firmware window (ROM execution) or
+        // a stray fetch into MMIO.  Route through the canonical read8
+        // dispatch so firmware windows work and MMIO fetches return
+        // whatever ext::mmap_read8 gives.
+        memory::read8(phys)
+    };
     *instruction_pointer = eip + 1;
     return Ok(data8);
 }
@@ -3060,13 +3072,20 @@ pub unsafe fn get_phys_eip() -> OrPageFault<u32> {
         *last_virt_eip = eip & !0xFFF
     }
     let phys_addr = (*eip_phys ^ eip) as u32;
-    dbg_assert!(!memory::in_mapped_range(phys_addr));
+    // Fetches from RAM are most common; fetches from a firmware window
+    // (OVMF, netboot BIOS) are also valid.  True MMIO fetches are still
+    // a bug.
+    dbg_assert!(
+        !memory::in_mapped_range(phys_addr) || memory::in_firmware_window(phys_addr)
+    );
     return Ok(phys_addr);
 }
 
 unsafe fn jit_run_interpreted(mut phys_addr: u32) {
     profiler::stat_increment(stat::RUN_INTERPRETED);
-    dbg_assert!(!memory::in_mapped_range(phys_addr));
+    dbg_assert!(
+        !memory::in_mapped_range(phys_addr) || memory::in_firmware_window(phys_addr)
+    );
 
     jit_block_boundary = false;
     let mut i = 0;
@@ -3083,7 +3102,14 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
 
         i += 1;
         let start_eip = *instruction_pointer;
-        let opcode = *memory::mem8.offset(phys_addr as isize) as i32;
+        // Matches the read_imm8 fast-path pattern: RAM inlined, firmware
+        // window / MMIO through the canonical dispatch.
+        let opcode = if phys_addr < *memory_size {
+            *memory::mem8.offset(phys_addr as isize) as i32
+        }
+        else {
+            memory::read8(phys_addr)
+        };
         *instruction_pointer += 1;
         dbg_assert!(*prefixes == 0);
         run_instruction(opcode | (*is_32 as i32) << 8);

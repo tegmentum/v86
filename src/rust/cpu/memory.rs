@@ -1,3 +1,13 @@
+// -------------------------------------------------------------------------
+// WASIP2 FORK NOTE:
+//   This file diverges from upstream copy/v86 on the wasip2-rom-windows
+//   branch.  The divergence adds optional ROM-window support so boot
+//   providers (OVMF, netboot BIOS) can map firmware above the flat RAM
+//   backing buffer.  Search for `FIRMWARE_WINDOW` / `firmware_window` for
+//   the hooks; the RAM fast path is deliberately untouched so interpreter
+//   performance on linux/seabios modes is unaffected.
+// -------------------------------------------------------------------------
+
 mod ext {
     extern "C" {
         pub fn mmap_read8(addr: u32) -> i32;
@@ -26,6 +36,91 @@ use std::ptr;
 
 #[allow(non_upper_case_globals)]
 pub static mut mem8: *mut u8 = ptr::null_mut();
+
+// -------------------------------------------------------------------------
+// Firmware window — single optional ROM region mapped above `memory_size`.
+//
+// The design goal is that ROM execution (OVMF, netboot BIOS, …) works
+// without growing the flat `mem8` backing buffer to cover the full 4 GiB
+// address space.  A firmware window is installed by the control plane
+// before CPU start; reads that fall above `memory_size` land here via
+// the existing MMIO dispatch chain.  Writes are currently dropped — v1
+// models firmware as true ROM.  NVRAM support is future work: add a
+// `writable: bool` flag and mirror writes into a separate variable
+// store.
+// -------------------------------------------------------------------------
+
+pub struct FirmwareWindow {
+    pub base: u32,
+    pub data: Box<[u8]>,
+}
+
+impl FirmwareWindow {
+    #[inline]
+    pub fn contains(&self, addr: u32) -> bool {
+        let lo = self.base as u64;
+        let hi = lo + self.data.len() as u64;
+        let a = addr as u64;
+        a >= lo && a < hi
+    }
+}
+
+#[allow(non_upper_case_globals)]
+pub static mut firmware_window: Option<FirmwareWindow> = None;
+
+/// Install a firmware window.  The previous window (if any) is dropped.
+/// Call BEFORE starting the CPU — installing while the CPU is running
+/// is undefined because the MMIO dispatch chain reads `firmware_window`
+/// without synchronisation.
+pub fn install_firmware_window(base: u32, data: Vec<u8>) {
+    unsafe {
+        firmware_window = Some(FirmwareWindow {
+            base,
+            data: data.into_boxed_slice(),
+        });
+    }
+}
+
+pub fn clear_firmware_window() {
+    unsafe {
+        firmware_window = None;
+    }
+}
+
+#[inline]
+#[allow(static_mut_refs)]
+pub fn in_firmware_window(addr: u32) -> bool {
+    unsafe {
+        match firmware_window.as_ref() {
+            Some(fw) => fw.contains(addr),
+            None => false,
+        }
+    }
+}
+
+#[inline]
+#[allow(static_mut_refs)]
+unsafe fn firmware_read8(addr: u32) -> i32 {
+    let fw = firmware_window.as_ref().unwrap_unchecked();
+    let off = (addr - fw.base) as usize;
+    *fw.data.get_unchecked(off) as i32
+}
+
+#[inline]
+#[allow(static_mut_refs)]
+unsafe fn firmware_read16(addr: u32) -> i32 {
+    let fw = firmware_window.as_ref().unwrap_unchecked();
+    let off = (addr - fw.base) as usize;
+    ptr::read_unaligned(fw.data.as_ptr().add(off) as *const u16) as i32
+}
+
+#[inline]
+#[allow(static_mut_refs)]
+unsafe fn firmware_read32(addr: u32) -> i32 {
+    let fw = firmware_window.as_ref().unwrap_unchecked();
+    let off = (addr - fw.base) as usize;
+    ptr::read_unaligned(fw.data.as_ptr().add(off) as *const i32)
+}
 
 #[no_mangle]
 pub fn allocate_memory(size: u32) -> u32 {
@@ -92,6 +187,9 @@ pub fn read8(addr: u32) -> i32 {
         else if addr >= IOAPIC_MEM_ADDRESS && addr < IOAPIC_MEM_ADDRESS + IOAPIC_MEM_SIZE {
             ioapic::read32((addr - IOAPIC_MEM_ADDRESS) & !3) as i32 >> 8 * (addr & 3) & 0xFF
         }
+        else if in_firmware_window(addr) {
+            unsafe { firmware_read8(addr) }
+        }
         else {
             unsafe { ext::mmap_read8(addr) }
         }
@@ -110,6 +208,9 @@ pub fn read16(addr: u32) -> i32 {
                 ptr::read_unaligned(vga_mem8.offset((addr - VGA_LFB_ADDRESS) as isize) as *const u16)
                     as i32
             }
+        }
+        else if in_firmware_window(addr) && in_firmware_window(addr + 1) {
+            unsafe { firmware_read16(addr) }
         }
         else {
             read8(addr) | read8(addr + 1) << 8
@@ -136,6 +237,9 @@ pub fn read32s(addr: u32) -> i32 {
         }
         else if addr >= IOAPIC_MEM_ADDRESS && addr < IOAPIC_MEM_ADDRESS + IOAPIC_MEM_SIZE {
             ioapic::read32(addr - IOAPIC_MEM_ADDRESS) as i32
+        }
+        else if in_firmware_window(addr) && in_firmware_window(addr + 3) {
+            unsafe { firmware_read32(addr) }
         }
         else {
             unsafe { ext::mmap_read32(addr) }
@@ -267,6 +371,9 @@ pub unsafe fn mmap_write8(addr: u32, value: i32) {
         vga::mark_dirty(addr);
         *vga_mem8.offset((addr - VGA_LFB_ADDRESS) as isize) = value as u8
     }
+    else if in_firmware_window(addr) {
+        // ROM — writes silently drop.  NVRAM support is future work.
+    }
     else {
         ext::mmap_write8(addr, value)
     }
@@ -278,6 +385,9 @@ pub unsafe fn mmap_write16(addr: u32, value: i32) {
             vga_mem8.offset((addr - VGA_LFB_ADDRESS) as isize) as *mut u16,
             value as u16,
         )
+    }
+    else if in_firmware_window(addr) {
+        // ROM — writes silently drop.
     }
     else {
         ext::mmap_write16(addr, value)
@@ -298,6 +408,9 @@ pub unsafe fn mmap_write32(addr: u32, value: i32) {
     else if addr >= IOAPIC_MEM_ADDRESS && addr < IOAPIC_MEM_ADDRESS + IOAPIC_MEM_SIZE {
         ioapic::write32(addr - IOAPIC_MEM_ADDRESS, value as u32);
         handle_irqs();
+    }
+    else if in_firmware_window(addr) {
+        // ROM — writes silently drop.
     }
     else {
         ext::mmap_write32(addr, value)
