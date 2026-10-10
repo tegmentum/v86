@@ -400,3 +400,14 @@ pub fn port4D0_read() -> u32 { get_pic().master.elcr as u32 }
 pub fn port4D1_read() -> u32 { get_pic().slave.elcr as u32 }
 pub fn port4D0_write(v: u8) { get_pic().master.elcr = v }
 pub fn port4D1_write(v: u8) { get_pic().slave.elcr = v }
+
+// Diagnostic accessors. Snapshot IRR / IMR / ISR for the master and slave
+// 8259 PICs so host-side device models can print PIC state alongside their
+// own trace output (see v86-devices/{ne2k_pci,ide}.rs and
+// v86-component/main.rs wake diagnostics).
+pub fn diag_master_irr() -> u8 { get_pic().master.irr }
+pub fn diag_master_imr() -> u8 { get_pic().master.irq_mask }
+pub fn diag_master_isr() -> u8 { get_pic().master.isr }
+pub fn diag_slave_irr()  -> u8 { get_pic().slave.irr }
+pub fn diag_slave_imr()  -> u8 { get_pic().slave.irq_mask }
+pub fn diag_slave_isr()  -> u8 { get_pic().slave.isr }
