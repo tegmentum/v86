@@ -75,6 +75,53 @@ pub fn in_mapped_range(addr: u32) -> bool {
     return addr >= 0xA0000 && addr < 0xC0000 || addr >= unsafe { *memory_size };
 }
 
+// -----------------------------------------------------------------------------
+// Firmware window — above-RAM ROM overlay used by firmware (SeaBIOS/OVMF).
+//
+// Above-RAM reads (`in_mapped_range` true, addr >= memory_size) fall through
+// to `ext::mmap_read*` by default. The firmware_window state is read by the
+// host-shim's mmap handlers to serve ROM bytes from a vendored copy, so a
+// snapshot does not have to re-pack the firmware image on every save.
+//
+// The window is a single contiguous span (`v1` — one firmware window per boot
+// per boot/apply.rs's `firmware_installed` guard). Grow to multiple spans
+// later if needed.
+// -----------------------------------------------------------------------------
+
+pub struct FirmwareWindow {
+    pub base: u32,
+    pub data: Vec<u8>,
+    pub writable: bool,
+}
+
+#[allow(non_upper_case_globals)]
+pub static mut firmware_window: Option<FirmwareWindow> = None;
+
+pub fn install_firmware_window(base: u32, data: Vec<u8>, writable: bool) {
+    unsafe {
+        firmware_window = Some(FirmwareWindow { base, data, writable });
+    }
+}
+
+pub fn clear_firmware_window() {
+    unsafe {
+        firmware_window = None;
+    }
+}
+
+pub fn in_firmware_window(addr: u32) -> bool {
+    unsafe {
+        let fw_ptr = &raw const firmware_window;
+        match &*fw_ptr {
+            Some(fw) => {
+                let end = fw.base.saturating_add(fw.data.len() as u32);
+                addr >= fw.base && addr < end
+            }
+            None => false,
+        }
+    }
+}
+
 pub const VGA_LFB_ADDRESS: u32 = 0xE0000000;
 pub fn in_svga_lfb(addr: u32) -> bool {
     addr >= VGA_LFB_ADDRESS && addr <= unsafe { VGA_LFB_ADDRESS + (vga_memory_size - 1) }
