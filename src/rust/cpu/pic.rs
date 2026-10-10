@@ -400,3 +400,85 @@ pub fn port4D0_read() -> u32 { get_pic().master.elcr as u32 }
 pub fn port4D1_read() -> u32 { get_pic().slave.elcr as u32 }
 pub fn port4D0_write(v: u8) { get_pic().master.elcr = v }
 pub fn port4D1_write(v: u8) { get_pic().slave.elcr = v }
+
+// Diagnostic accessors. Snapshot IRR / IMR / ISR for the master and slave
+// 8259 PICs so host-side device models can print PIC state alongside their
+// own trace output (see v86-devices/{ne2k_pci,ide}.rs and
+// v86-component/main.rs wake diagnostics).
+pub fn diag_master_irr() -> u8 { get_pic().master.irr }
+pub fn diag_master_imr() -> u8 { get_pic().master.irq_mask }
+pub fn diag_master_isr() -> u8 { get_pic().master.isr }
+pub fn diag_slave_irr()  -> u8 { get_pic().slave.irr }
+pub fn diag_slave_imr()  -> u8 { get_pic().slave.irq_mask }
+pub fn diag_slave_isr()  -> u8 { get_pic().slave.isr }
+
+// -----------------------------------------------------------------------------
+// Snapshot save/load (mirrors the pit.rs pattern).
+// -----------------------------------------------------------------------------
+//
+// Per Pic0 we serialize 11 bytes: 7 u8 state fields + 4 bool state fields.
+// Fixed `master: bool` and the historical `dummy: u8` are omitted — the first
+// is positional (master then slave) and the second is marked for removal in
+// the struct definition.
+//
+// Layout: version(4) + master(11) + slave(11) = 26 bytes.
+
+pub const PIC_SERIALIZATION_VERSION: u32 = 1;
+
+fn save_pic0(p: &Pic0, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    w.write_all(&[p.irq_mask])?;
+    w.write_all(&[p.irq_map])?;
+    w.write_all(&[p.isr])?;
+    w.write_all(&[p.irr])?;
+    w.write_all(&[p.state])?;
+    w.write_all(&[p.elcr])?;
+    w.write_all(&[p.irq_value])?;
+    w.write_all(&[p.expect_icw4 as u8])?;
+    w.write_all(&[p.read_isr as u8])?;
+    w.write_all(&[p.auto_eoi as u8])?;
+    w.write_all(&[p.special_mask_mode as u8])?;
+    Ok(())
+}
+
+fn load_pic0(p: &mut Pic0, r: &mut dyn std::io::Read) -> std::io::Result<()> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?; p.irq_mask = b[0];
+    r.read_exact(&mut b)?; p.irq_map = b[0];
+    r.read_exact(&mut b)?; p.isr = b[0];
+    r.read_exact(&mut b)?; p.irr = b[0];
+    r.read_exact(&mut b)?; p.state = b[0];
+    r.read_exact(&mut b)?; p.elcr = b[0];
+    r.read_exact(&mut b)?; p.irq_value = b[0];
+    r.read_exact(&mut b)?; p.expect_icw4 = b[0] != 0;
+    r.read_exact(&mut b)?; p.read_isr = b[0] != 0;
+    r.read_exact(&mut b)?; p.auto_eoi = b[0] != 0;
+    r.read_exact(&mut b)?; p.special_mask_mode = b[0] != 0;
+    Ok(())
+}
+
+pub fn save_snapshot(w: &mut dyn std::io::Write) -> std::io::Result<()> {
+    w.write_all(&PIC_SERIALIZATION_VERSION.to_le_bytes())?;
+    let pic = get_pic();
+    save_pic0(&pic.master, w)?;
+    save_pic0(&pic.slave, w)?;
+    Ok(())
+}
+
+pub fn load_snapshot(r: &mut dyn std::io::Read) -> std::io::Result<()> {
+    let mut ver = [0u8; 4];
+    r.read_exact(&mut ver)?;
+    let ver = u32::from_le_bytes(ver);
+    if ver != PIC_SERIALIZATION_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "PIC version mismatch: expected {}, found {}",
+                PIC_SERIALIZATION_VERSION, ver
+            ),
+        ));
+    }
+    let mut pic = get_pic();
+    load_pic0(&mut pic.master, r)?;
+    load_pic0(&mut pic.slave, r)?;
+    Ok(())
+}
